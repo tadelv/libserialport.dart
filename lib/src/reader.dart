@@ -147,11 +147,16 @@ class _SerialPortReaderImpl implements SerialPortReader {
         final ptr = arena<ffi.Uint8>(MAX_LEN);
         bytes = dylib.sp_blocking_read(port, ptr.cast(), MAX_LEN, args.timeout);
 
-        if(bytes < 0) {
-          throw bytes;
+        // Only slice a fresh Uint8List when we actually have data. For
+        // bytes == 0 (timeout) and bytes < 0 (error) leave `data` untouched;
+        // the block below handles both cases. Previously this path called
+        // `throw bytes;` on negative returns, which escaped the isolate as
+        // an unhandled exception and silently killed the reader. Consumers
+        // on the receiving `sendPort` never saw an error and their stream
+        // subscription went quiet.
+        if (bytes > 0) {
+          data = Uint8List.fromList(ptr.asTypedList(bytes));
         }
-        
-        data = Uint8List.fromList(ptr.asTypedList(bytes));
       });
 
       if (bytes > 0) {
