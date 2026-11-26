@@ -145,7 +145,7 @@ class _SerialPortReaderImpl implements SerialPortReader {
     while (bytes >= 0) {
       ffi.using((arena) {
         final ptr = arena<ffi.Uint8>(MAX_LEN);
-        bytes = dylib.sp_blocking_read(port, ptr.cast(), MAX_LEN, args.timeout);
+        bytes = dylib.sp_blocking_read_next(port, ptr.cast(), MAX_LEN, args.timeout);
 
         // Only slice a fresh Uint8List when we actually have data. For
         // bytes == 0 (timeout) and bytes < 0 (error) leave `data` untouched;
