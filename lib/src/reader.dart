@@ -45,8 +45,9 @@ import 'package:libserialport/src/port.dart';
 /// **Note:** The reader must be closed using [close()] when done with reading.
 abstract class SerialPortReader {
   /// Creates a reader for the port. Optional [timeout] parameter can be
-  /// provided to bound each blocking read in milliseconds. It must be positive
-  /// so cancellation can wait for the worker to finish. Defaults to 500ms.
+  /// provided to bound each blocking read in milliseconds. It must be in
+  /// 1..0xfffffffe so cancellation can wait for the worker to finish. Zero
+  /// disables the native timeout; Windows reserves 0xffffffff. Defaults to 500ms.
   factory SerialPortReader(SerialPort port, {int? timeout}) =>
       _SerialPortReaderImpl(port, timeout: timeout);
 
@@ -83,9 +84,7 @@ class _SerialPortReaderImpl implements SerialPortReader {
   _SerialPortReaderImpl(SerialPort port, {int? timeout})
       : _port = port,
         _timeout = timeout ?? 500 {
-    if (_timeout <= 0) {
-      throw ArgumentError.value(timeout, 'timeout', 'Must be positive');
-    }
+    RangeError.checkValueInInterval(_timeout, 1, 0xfffffffe, 'timeout');
   }
 
   @override
