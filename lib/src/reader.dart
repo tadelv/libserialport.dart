@@ -32,9 +32,6 @@ import 'package:libserialport/src/bindings.dart';
 import 'package:libserialport/src/dylib.dart';
 import 'package:libserialport/src/error.dart';
 import 'package:libserialport/src/port.dart';
-import 'package:libserialport/src/util.dart';
-
-const int _kReadEvents = sp_event.SP_EVENT_RX_READY | sp_event.SP_EVENT_ERROR;
 
 /// Asynchronous serial port reader.
 ///
@@ -48,9 +45,8 @@ const int _kReadEvents = sp_event.SP_EVENT_RX_READY | sp_event.SP_EVENT_ERROR;
 /// **Note:** The reader must be closed using [close()] when done with reading.
 abstract class SerialPortReader {
   /// Creates a reader for the port. Optional [timeout] parameter can be
-  /// provided to specify a time im milliseconds between attempts to read after
-  /// a failure to open the [port] for reading. If not given, [timeout] defaults
-  /// to 500ms.
+  /// provided to bound each blocking read in milliseconds. It must be positive
+  /// so cancellation can wait for the worker to finish. Defaults to 500ms.
   factory SerialPortReader(SerialPort port, {int? timeout}) =>
       _SerialPortReaderImpl(port, timeout: timeout);
 
@@ -60,8 +56,8 @@ abstract class SerialPortReader {
   /// Gets a stream of data.
   Stream<Uint8List> get stream;
 
-  /// Closes the stream.
-  void close();
+  /// Closes the stream after the reader has finished using the port.
+  Future<void> close();
 }
 
 class _SerialPortReaderArgs {
@@ -78,14 +74,19 @@ class _SerialPortReaderArgs {
 class _SerialPortReaderImpl implements SerialPortReader {
   final SerialPort _port;
   final int _timeout;
-  Isolate? _isolate;
-  ReceivePort? _receiver;
-  StreamController<Uint8List>? __controller;
+  Future<void> _operations = Future<void>.value();
+  Future<void> Function()? _stopWorker;
+  Future<void>? _closing;
+  bool _closed = false;
   static const MAX_LEN = 255;
 
   _SerialPortReaderImpl(SerialPort port, {int? timeout})
       : _port = port,
-        _timeout = timeout ?? 500;
+        _timeout = timeout ?? 500 {
+    if (_timeout <= 0) {
+      throw ArgumentError.value(timeout, 'timeout', 'Must be positive');
+    }
+  }
 
   @override
   SerialPort get port => _port;
@@ -93,101 +94,129 @@ class _SerialPortReaderImpl implements SerialPortReader {
   @override
   Stream<Uint8List> get stream => _controller.stream;
 
+  late final _controller = StreamController<Uint8List>(
+    onListen: _start,
+    onCancel: _cancel,
+    onPause: _cancel,
+    onResume: _start,
+  );
+
   @override
-  void close() {
-    __controller?.close();
-    __controller = null;
+  Future<void> close() {
+    _closed = true;
+    return _closing ??= _cancel().whenComplete(() {
+      _controller.close();
+    });
   }
 
-  StreamController<Uint8List> get _controller {
-    return __controller ??= StreamController<Uint8List>(
-      onListen: _startRead,
-      onCancel: _cancelRead,
-      onPause: _cancelRead,
-      onResume: _startRead,
-    );
+  void _start() {
+    _operations = _operations.then((_) => _startRead());
   }
 
-  void _startRead() {
-    _receiver = ReceivePort();
-    _receiver!.listen((data) {
-      if (data is SerialPortError) {
-        _controller.addError(data);
-      } else if (data is Uint8List) {
-        _controller.add(data);
+  Future<void> _cancel() {
+    return _operations = _operations.then((_) async {
+      final stop = _stopWorker;
+      _stopWorker = null;
+      await stop?.call();
+    });
+  }
+
+  Future<void> _startRead() async {
+    if (_closed ||
+        !_controller.hasListener ||
+        _controller.isPaused ||
+        _stopWorker != null) {
+      return;
+    }
+    final receiver = ReceivePort();
+    final ready = Completer<SendPort>();
+    ready.future.ignore();
+    final exited = Completer<void>();
+    var stopping = false;
+    receiver.listen((message) {
+      if (message is SendPort) {
+        ready.complete(message);
+      } else if (message == null) {
+        receiver.close();
+        if (!ready.isCompleted) {
+          ready.completeError(
+            StateError('Serial reader exited during startup'),
+          );
+        }
+        exited.complete();
+        if (!stopping && !_controller.isClosed) _controller.close();
+      } else if (!_closed && !_controller.isClosed) {
+        if (message is Uint8List) {
+          _controller.add(message);
+        } else if (message is SerialPortError) {
+          _controller.addError(message);
+        } else if (message is List) {
+          _controller.addError(
+            StateError('${message[0]}'),
+            StackTrace.fromString('${message[1]}'),
+          );
+        }
       }
     });
-    final args = _SerialPortReaderArgs(
-      address: _port.address,
-      timeout: _timeout,
-      sendPort: _receiver!.sendPort,
-    );
-    Isolate.spawn(
-      _waitRead,
-      args,
-      debugName: toString(),
-    ).then((value) => _isolate = value);
-  }
-
-  void _cancelRead() {
-    _receiver?.close();
-    _receiver = null;
-    _isolate?.kill();
-    _isolate = null;
-  }
-
-  static void _waitRead(_SerialPortReaderArgs args) {
-    final port = ffi.Pointer<sp_port>.fromAddress(args.address);
-    final events = _createEvents(port, _kReadEvents);
-    var bytes = 0;
-    Uint8List data = Uint8List(0);
-
-    while (bytes >= 0) {
-      ffi.using((arena) {
-        final ptr = arena<ffi.Uint8>(MAX_LEN);
-        bytes = dylib.sp_blocking_read(port, ptr.cast(), MAX_LEN, args.timeout);
-
-        // Only slice a fresh Uint8List when we actually have data. For
-        // bytes == 0 (timeout) and bytes < 0 (error) leave `data` untouched;
-        // the block below handles both cases. Previously this path called
-        // `throw bytes;` on negative returns, which escaped the isolate as
-        // an unhandled exception and silently killed the reader. Consumers
-        // on the receiving `sendPort` never saw an error and their stream
-        // subscription went quiet.
-        if (bytes > 0) {
-          data = Uint8List.fromList(ptr.asTypedList(bytes));
-        }
-      });
-
-      if (bytes > 0) {
-        args.sendPort.send(data);
-      } else if (bytes < 0) {
-        args.sendPort.send(SerialPort.lastError);
+    try {
+      await Isolate.spawn(
+        _waitRead,
+        _SerialPortReaderArgs(
+          address: _port.address,
+          timeout: _timeout,
+          sendPort: receiver.sendPort,
+        ),
+        debugName: toString(),
+        onExit: receiver.sendPort,
+        onError: receiver.sendPort,
+      );
+      final commands = await ready.future;
+      _stopWorker = () async {
+        stopping = true;
+        if (!exited.isCompleted) commands.send(null);
+        await exited.future;
+      };
+    } catch (error, stack) {
+      receiver.close();
+      if (!_controller.isClosed) {
+        _controller.addError(error, stack);
+        _controller.close();
       }
     }
-    _releaseEvents(events);
   }
 
-  static ffi.Pointer<ffi.Pointer<sp_event_set>> _createEvents(
-    ffi.Pointer<sp_port> port,
-    int mask,
-  ) {
-    final events = ffi.calloc<ffi.Pointer<sp_event_set>>();
-    dylib.sp_new_event_set(events);
-    dylib.sp_add_port_events(events.value, port, mask);
-    return events;
-  }
-
-  static int _waitEvents(
-    ffi.Pointer<sp_port> port,
-    ffi.Pointer<ffi.Pointer<sp_event_set>> events,
-    int timeout,
-  ) {
-    dylib.sp_wait(events.value, timeout);
-    return dylib.sp_input_waiting(port);
-  }
-
-  static void _releaseEvents(ffi.Pointer<ffi.Pointer<sp_event_set>> events) {
-    dylib.sp_free_event_set(events.value);
+  static Future<void> _waitRead(_SerialPortReaderArgs args) async {
+    final port = ffi.Pointer<sp_port>.fromAddress(args.address);
+    final commands = ReceivePort();
+    var stopping = false;
+    commands.listen((_) => stopping = true);
+    args.sendPort.send(commands.sendPort);
+    try {
+      while (!stopping) {
+        final bytes = ffi.using((arena) {
+          final ptr = arena<ffi.Uint8>(MAX_LEN);
+          final count = dylib.sp_blocking_read_next(
+            port,
+            ptr.cast(),
+            MAX_LEN,
+            args.timeout,
+          );
+          if (count > 0) {
+            args.sendPort.send(Uint8List.fromList(ptr.asTypedList(count)));
+          }
+          return count;
+        });
+        if (bytes < 0) {
+          args.sendPort.send(
+            SerialPort.lastError ??
+                SerialPortError('Serial read failed', bytes),
+          );
+          break;
+        }
+        await Future<void>.delayed(Duration.zero);
+      }
+    } finally {
+      commands.close();
+    }
   }
 }
